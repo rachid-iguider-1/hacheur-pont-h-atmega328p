@@ -1,0 +1,296 @@
+// =========================================================================
+// DIRECTIVES DE COMPILATION ET BIBLIOTHÈQUES 
+// =========================================================================
+
+/* * 1. <avr/io.h> : En-tête Fondamental des Registres d'Entrées/Sorties AVR
+ * - Rôle : Fournit les définitions internes pour le microcontrôleur ATmega328P.
+ * - Justification : Contient la table de correspondance (mapping) entre les noms des registres 
+ * en langage C (ex: PORTD, DDRB, TCCR1A) et leurs adresses physiques réelles dans la mémoire.
+ * Elle est indispensable pour toute la programmation "Bare-Metal" (accès direct au matériel) de notre hacheur.
+ */
+#include <avr/io.h>
+
+/* * 2. <util/delay.h> : Gestion Précise des Temporisations Matérielles
+ * - Rôle : Fournit des fonctions de retard temporel calibrées (_delay_ms() et _delay_us()).
+ * - Justification : Calcule statiquement le nombre de cycles d'horloge (instructions NOP) nécessaires 
+ * pour suspendre le processeur selon la fréquence du quartz (F_CPU = 16 MHz). Elle est cruciale ici 
+ * pour fixer la période d'échantillonnage de la boucle à 20 ms et servir d'anti-rebond logiciel passif.
+ */
+#include <util/delay.h>
+
+/* * 3. <stdio.h> : Standard Input/Output et Formatage de Données
+ * - Rôle : Bibliothèque standard du C dédiée aux flux de données et au formatage de texte.
+ * - Justification : Utilisée pour la fonction 'snprintf()'. Elle permet de formater proprement les chaînes 
+ * de caractères envoyées au LCD (ex: formater le PWM sur 3 caractères fixes avec "%3u %%" pour éviter les 
+ * pixels parasites) tout en protégeant le système contre les débordements de tampon (buffer overflow).
+ */
+#include <stdio.h>
+
+/* * 4. <Wire.h> : Pilote du Bus de Communication Matériel I2C (Interface TWI)
+ * - Rôle : Gère l'interface série synchrone à deux fils (Two-Wire Interface) native de l'ATmega328P.
+ * - Justification : Encapsule la gestion rigoureuse des signaux d'horloge (SCL), de données (SDA), des 
+ * conditions de Start/Stop et des acquittements (ACK/NACK). Elle permet de communiquer à 100 kHz avec 
+ * l'afficheur sans surcharger le code principal avec une machine à états I2C complexe.
+ */
+#include <Wire.h>
+
+/* * 5. <LiquidCrystal_I2C.h> : Pilote de Haut Niveau pour Écran Alphanumérique
+ * - Rôle : Pilote pour contrôleur LCD Hitachi HD44780 associé à un extenseur de broches I2C PCF8574.
+ * - Justification : Permet de commander l'intégralité de l'interface de supervision (16x2) en utilisant 
+ * uniquement 2 broches (SDA et SCL) au lieu de 6 à 10 broches en mode parallèle standard. Elle simplifiera 
+ * considérablement le routage final du circuit imprimé (PCB).
+ */
+#include <LiquidCrystal_I2C.h>
+
+// =========================================================================
+// CONSTANTES ET CONFIGURATIONS MATÉRIELLES
+// =========================================================================
+
+// Configuration de la PWM à 10 kHz (Horloge système = 16 MHz, Prescaler = 1)
+// Formule : F_pwm = F_cpu / (Prescaler * (1 + TOP))
+// 16 000 000 / (1 * (1 + 1599)) = 10 000 Hz = 10 kHz
+#define PWM_TOP 1599
+
+// Sécurité Bootstrap : limitation du rapport cyclique maximal à 90% 
+// Permet de forcer l'état bas 10% du temps pour recharger le condensateur de bootstrap du driver IR2104
+#define MAX_DUTY ((PWM_TOP * 90UL) / 100) 
+
+// Définition des états de la machine à états du moteur
+#define MODE_ARRET    0
+#define MODE_AVANT    1
+#define MODE_ARRIERE  2
+
+// Instanciation de l'écran LCD via le bus I2C (Adresse standard 0x27, 16 colonnes, 2 lignes)
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
+
+// =========================================================================
+// VARIABLES GLOBALES
+// =========================================================================
+uint8_t motor_mode = MODE_ARRET;      // Mode de fonctionnement actif du moteur
+uint8_t last_btn1_state = 1;         // Sauvegarde de l'état précédent du bouton 1 (1 = relâché grâce au Pull-up)
+uint8_t last_btn2_state = 1;         // Sauvegarde de l'état précédent du bouton 2 (1 = relâché grâce au Pull-up)
+uint8_t lcd_counter = 0;             // Compteur logiciel pour cadencer le rafraîchissement du LCD
+char lineBuffer[17];                 // Tampon mémoire pour formater les chaînes de caractères (16 caractères + '\0')
+
+// =========================================================================
+// FONCTIONS D'INITIALISATION DU MICROCONTRÔLEUR (BARE METAL)
+// =========================================================================
+
+/**
+ * Configure le Timer 1 (16 bits) pour générer deux signaux PWM à 10 kHz
+ * Sorties physiques : Broche 9 (PB1 / OC1A) et Broche 10 (PB2 / OC1B)
+ */
+void init_PWM() {
+    // 1. Configurer les broches PB1 (OC1A) et PB2 (OC1B) en sorties directionnelles
+    DDRB |= (1 << PB1) | (1 << PB2); 
+
+    // 2. TCCR1A : Configuration du mode de comparaison et des bits de forme d'onde (WGM)
+    // COM1A1 & COM1B1 = Mode PWM non-inversé (Clear on Compare Match, Set at BOTTOM)
+    // WGM11 = Partie basse du Mode Fast PWM avec ICR1 pour valeur TOP
+    TCCR1A = (1 << COM1A1) | (1 << COM1B1) | (1 << WGM11);
+
+    // 3. TCCR1B : Configuration de la partie haute du mode WGM et choix du diviseur d'horloge
+    // WGM13 & WGM12 = Complète le mode Fast PWM (Mode 14)
+    // CS10 = Prescaler de 1 (pas de division de la fréquence d'horloge de 16 MHz)
+    TCCR1B = (1 << WGM13) | (1 << WGM12) | (1 << CS10); 
+
+    // 4. Définition de la valeur maximale du compteur (Période de la PWM)
+    ICR1 = PWM_TOP;
+
+    // 5. Initialisation des rapports cycliques à 0 (Moteur à l'arrêt par défaut)
+    OCR1A = 0;
+    OCR1B = 0;
+}
+
+/**
+ * Configure les broches des boutons-poussoirs en entrées avec résistances de tirage
+ * Entrées physiques : Broche 2 (PD2) et Broche 3 (PD3)
+ */
+void init_Buttons() {
+    DDRD &= ~((1 << PD2) | (1 << PD3)); // Force les bits PD2 et PD3 à 0 (Mode Entrée)
+    PORTD |= (1 << PD2) | (1 << PD3);   // Active les résistances de Pull-up internes (État haut par défaut)
+}
+
+/**
+ * Configure les broches des LEDs de signalisation de direction en sorties
+ * Sorties physiques : Broche 4 (PD4 / LED Verte) et Broche 5 (PD5 / LED Bleue)
+ */
+void init_LEDs() {
+    DDRD |= (1 << PD4) | (1 << PD5);     // Force les bits PD4 et PD5 à 1 (Mode Sortie)
+    PORTD &= ~((1 << PD4) | (1 << PD5)); // Éteint les LEDs par défaut au démarrage
+}
+
+/**
+ * Configure le Convertisseur Analogique-Numérique (ADC)
+ * Entrée physique par défaut : Broche A0 (Entrée analogique du potentiomètre)
+ */
+void init_ADC() {
+    // REFS0 = Sélection de la tension de référence AVCC (5V de la carte)
+    // Les bits MUX3..0 restent à 0000 pour sélectionner le canal ADC0 (Broche A0)
+    ADMUX = (1 << REFS0); 
+
+    // ADEN = Activation du module ADC
+    // ADPS2, ADPS1, ADPS0 = Configuration du diviseur de fréquence (Prescaler) à 128
+    // 16 MHz / 128 = 125 kHz (Fréquence d'échantillonnage optimale pour la précision de l'ADC AVR)
+    ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0); 
+}
+
+// =========================================================================
+// FONCTIONS DE LECTURE ET DE TRAITEMENT
+// =========================================================================
+
+/**
+ * Effectue une conversion analogique-numérique synchrone sur le canal ADC0
+ * @return Valeur brute numérisée sur 10 bits (de 0 à 1023)
+ */
+uint16_t read_ADC() {
+    ADCSRA |= (1 << ADSC);           // Déclenche la conversion (ADC Start Conversion)
+    while (ADCSRA & (1 << ADSC));    // Boucle d'attente bloquante tant que le bit ADSC est à 1 (fin de conversion)
+    return ADC;                      // Retourne le registre de résultat complet (ADCL + ADCH)
+}
+
+/**
+ * Pilote l'étage de puissance en mettant à jour les registres de comparaison du Timer 
+ * @param pwm_P1 Rapport cyclique pour le bras de puissance 1 (Marche Avant)
+ * @param pwm_P2 Rapport cyclique pour le bras de puissance 2 (Marche Arrière)
+ */
+void drive_motor(uint16_t pwm_P1, uint16_t pwm_P2) {
+    // Sécurité 1 : Écrêtage logiciel pour respecter la contrainte du Bootstrap (90% max)
+    if (pwm_P1 > MAX_DUTY) pwm_P1 = MAX_DUTY;
+    if (pwm_P2 > MAX_DUTY) pwm_P2 = MAX_DUTY;
+
+    // Sécurité 2 : Verrouillage anti-court-circuit transversal (Shoot-Through)
+    // Interdiction stricte d'envoyer un signal de commande sur les deux bras simultanément
+    if (pwm_P1 > 0 && pwm_P2 > 0) { 
+        OCR1A = 0; 
+        OCR1B = 0;
+        return;
+    }
+    
+    // Assignation des valeurs aux registres matériels du Timer pour mise à jour de la PWM
+    OCR1A = pwm_P1;
+    OCR1B = pwm_P2;
+}
+
+// =========================================================================
+// CONFIGURATION DU SYSTÈME (SETUP ARDUINO)
+// =========================================================================
+void setup() {
+    // 1. Initialisation bas niveau des périphériques matériels
+    init_PWM();
+    init_Buttons();
+    init_LEDs(); 
+    init_ADC();
+    
+    // 2. Initialisation de la couche d'abstraction de l'afficheur LCD I2C
+    lcd.init();           
+    lcd.backlight();      
+    
+    // Séquence d'accueil : validation de l'intégrité de l'affichage
+    lcd.setCursor(0, 0);
+    lcd.print("HACHEUR EN PONTH");
+    _delay_ms(3000); // Temporisation de démarrage de 3 secondes
+    lcd.clear();
+}
+
+// =========================================================================
+// BOUCLE PRINCIPALE (LOOP ARDUINO / WHILE(1) TEMPS RÉEL)
+// =========================================================================
+void loop() {
+    // ---------------------------------------------------------------------
+    // PARTIE 1 : TRAITEMENT DE LA CONSIGNE DE VITESSE (POTENTIOMÈTRE)
+    // ---------------------------------------------------------------------
+    uint16_t adc_value = read_ADC();
+    uint16_t current_pwm = 0;
+    uint8_t pwm_percent = 0;
+
+    // SÉCURITÉ ZONE MORTE : Si la valeur de l'ADC est inférieure à 50 (~0.24V),
+    // on force l'arrêt pour éviter les sifflements inductifs et le broutement mécanique à faible tension.
+    if (adc_value > 50) { 
+        // Règle de trois pour convertir la plage ADC (0-1023) vers la plage PWM bridée (0-MAX_DUTY)
+        current_pwm = (adc_value * (uint32_t)MAX_DUTY) / 1023;
+        // Calcul du pourcentage réel de la vitesse pour l'affichage LCD
+        pwm_percent = ((uint32_t)adc_value * 100UL) / 1023;
+        
+        // Sécurité contre les arrondis mathématiques pour ne jamais afficher > 100%
+        if (pwm_percent > 100) pwm_percent = 100; 
+    } 
+    else {
+        current_pwm = 0;
+        pwm_percent = 0;
+    }
+
+    // ---------------------------------------------------------------------
+    // PARTIE 2 : LECTURE ASYNCHRONE ET SÉCURISATION DES BOUTONS (MACHINE À ÉTATS)
+    // ---------------------------------------------------------------------
+    // Lecture directe du registre d'entrée PIND et masquage pour isoler l'état logique
+    uint8_t current_btn1_val = (PIND & (1 << PD2)) >> PD2;
+    uint8_t current_btn2_val = (PIND & (1 << PD3)) >> PD3;
+
+    // Gestion du Bouton 1 (Marche Avant) : Détection sur front montant (lors du relâchement du bouton)
+    // Explication : En Pull-up, enfoncé = 0, relâché = 1. Passer de 0 à 1 valide l'action après appui.
+    if (last_btn1_state == 0 && current_btn1_val == 1) { 
+        // Si on était déjà en marche avant, on s'arrête. Sinon, on active la marche avant.
+        motor_mode = (motor_mode == MODE_AVANT) ? MODE_ARRET : MODE_AVANT;
+    }
+    last_btn1_state = current_btn1_val; // Mise à jour de la mémoire d'état
+
+    // Gestion du Bouton 2 (Marche Arrière) : Détection sur front montant
+    if (last_btn2_state == 0 && current_btn2_val == 1) { 
+        // Si on était déjà en marche arrière, on s'arrête. Sinon, on bascule en marche arrière.
+        motor_mode = (motor_mode == MODE_ARRIERE) ? MODE_ARRET : MODE_ARRIERE;
+    }
+    last_btn2_state = current_btn2_val; // Mise à jour de la mémoire d'état
+
+    // ---------------------------------------------------------------------
+    // PARTIE 3 : PILOTAGE DE LA PUISSANCE ET DE LA SIGNALISATION VISUELLE
+    // ---------------------------------------------------------------------
+    if (motor_mode == MODE_AVANT) {
+        drive_motor(current_pwm, 0);     // Injection PWM sur le bras A, bras B forcé à 0
+        PORTD |= (1 << PD4);             // Allumage LED Verte
+        PORTD &= ~(1 << PD5);            // Extinction LED Bleue
+    } 
+    else if (motor_mode == MODE_ARRIERE) {
+        drive_motor(0, current_pwm);     // Injection PWM sur le bras B, bras A forcé à 0
+        PORTD &= ~(1 << PD4);            // Extinction LED Verte
+        PORTD |= (1 << PD5);             // Allumage LED Bleue
+    } 
+    else {
+        // Mode ARRÊT sécurisé par défaut
+        drive_motor(0, 0);               // Extinction complète des signaux du pont en H
+        PORTD &= ~((1 << PD4) | (1 << PD5)); // Extinction simultanée des deux LEDs
+    }
+
+    // ---------------------------------------------------------------------
+    // PARTIE 4 : FILTRAGE TEMPOREL ET RAFRAÎCHISSEMENT DE L'AFFICHAGE LCD
+    // ---------------------------------------------------------------------
+    // L'exécution de la boucle prenant 20 ms, on incrémente un compteur pour n'écrire
+    // sur le LCD que toutes les 200 ms (10 itérations), ce qui supprime les effets de scintillement.
+    lcd_counter++;
+    if (lcd_counter >= 10) {
+        lcd_counter = 0;
+
+        // Mise à jour de la Ligne 1 : Sens de rotation (Formatage d'une chaîne fixe de 16 caractères)
+        lcd.setCursor(0, 0);
+        if (motor_mode == MODE_AVANT) {
+            snprintf(lineBuffer, sizeof(lineBuffer), "DIR: AVANT      ");
+        } else if (motor_mode == MODE_ARRIERE) {
+            snprintf(lineBuffer, sizeof(lineBuffer), "DIR: ARRIERE    ");
+        } else {
+            snprintf(lineBuffer, sizeof(lineBuffer), "DIR: ARRET      ");
+        }
+        lcd.print(lineBuffer);
+
+        // Mise à jour de la Ligne 2 : Affichage dynamique du rapport cyclique (%)
+        lcd.setCursor(0, 1);
+        snprintf(lineBuffer, sizeof(lineBuffer), "PWM: %3u %%       ", (unsigned int)pwm_percent);
+        lcd.print(lineBuffer);
+    }
+
+    // ---------------------------------------------------------------------
+    // PARTIE 5 : BASE DE TEMPS GLOBALE ET ANTI-REBOND
+    // ---------------------------------------------------------------------
+    // Fixe la période d'échantillonnage de la boucle de régulation à 20 ms.
+    // Cette temporisation fait également office d'anti-rebond logiciel passif pour les boutons.
+    _delay_ms(20);
+}
